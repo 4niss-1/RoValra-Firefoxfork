@@ -233,12 +233,32 @@ if (fs.existsSync('public')) {
 if (fs.existsSync('assets')) {
     processDirectory('assets', path.join('dist', 'assets'));
 }
-
 if (fs.existsSync('manifest.json')) {
     try {
         const manifestContent = fs.readFileSync('manifest.json', 'utf8');
         const manifestJson = JSON.parse(manifestContent);
-        fs.writeFileSync('dist/manifest.json', JSON.stringify(manifestJson));
+
+        if (process.argv.includes('--firefox')) {
+            manifestJson.browser_specific_settings = {
+                gecko: {
+                    id: 'rovalra-firefox@4niss-1',
+                    strict_min_version: '128.0'
+                }
+            };
+
+            if (manifestJson.background?.service_worker) {
+                manifestJson.background.scripts = [
+                    manifestJson.background.service_worker
+                ];
+            }
+
+            console.log('[firefox] Applied manifest patches');
+        }
+
+        fs.writeFileSync(
+            'dist/manifest.json',
+            JSON.stringify(manifestJson, null, 2)
+        );
     } catch (e) {
         console.log(e);
         fs.copyFileSync('manifest.json', 'dist/manifest.json');
