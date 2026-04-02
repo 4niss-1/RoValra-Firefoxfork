@@ -1,9 +1,10 @@
-name: Build and Package Only
+name: Build and Package Firefox
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 jobs:
   build-and-package:
@@ -23,16 +24,16 @@ jobs:
         run: npm ci
 
       - name: Build extension
-        run: npm run build
+        run: npm run build:firefox
 
       - name: Package extension
         run: |
           cd dist
-          zip -r ../rovalra-${{ github.ref_name }}.zip .
+          zip -r ../rovalra-firefox-${{ github.ref_name }}.zip .
 
       - name: Upload ZIP for Manual Download
         uses: actions/upload-artifact@v4
         with:
-          name: rovalra-build-files
-          path: rovalra-*.zip
+          name: rovalra-firefox-build
+          path: rovalra-firefox-*.zip
           retention-days: 5
