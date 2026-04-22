@@ -4,6 +4,68 @@ import {
     getBatchThumbnails,
 } from '../../thumbnail/thumbnails';
 import { callRobloxApiJson } from '../../api';
+import { getAssets } from '../../assets';
+
+const presenceQueue = {
+    pendingIds: new Set(),
+    promises: new Map(),
+    timer: null,
+    BATCH_DELAY: 50,
+};
+
+function flushPresenceQueue() {
+    const userIds = Array.from(presenceQueue.pendingIds);
+    presenceQueue.pendingIds.clear();
+    presenceQueue.timer = null;
+
+    if (userIds.length === 0) return;
+
+    callRobloxApiJson({
+        subdomain: 'presence',
+        endpoint: '/v1/presence/users',
+        method: 'POST',
+        body: { userIds },
+    })
+        .then((res) => {
+            const presenceMap = new Map(
+                (res?.userPresences || []).map((p) => [p.userId, p]),
+            );
+            for (const userId of userIds) {
+                const presence = presenceMap.get(userId) || null;
+                const resolvers = presenceQueue.promises.get(userId) || [];
+                presenceQueue.promises.delete(userId);
+                for (const resolve of resolvers) {
+                    resolve(presence);
+                }
+            }
+        })
+        .catch(() => {
+            for (const userId of userIds) {
+                const resolvers = presenceQueue.promises.get(userId) || [];
+                presenceQueue.promises.delete(userId);
+                for (const resolve of resolvers) {
+                    resolve(null);
+                }
+            }
+        });
+}
+
+export function fetchPresenceBatched(userId) {
+    return new Promise((resolve) => {
+        presenceQueue.pendingIds.add(userId);
+        if (!presenceQueue.promises.has(userId)) {
+            presenceQueue.promises.set(userId, []);
+        }
+        presenceQueue.promises.get(userId).push(resolve);
+
+        if (!presenceQueue.timer) {
+            presenceQueue.timer = setTimeout(
+                flushPresenceQueue,
+                presenceQueue.BATCH_DELAY,
+            );
+        }
+    });
+}
 
 const PRESENCE_MAP = {
     0: { class: 'offline icon-offline', title: 'Offline' },
@@ -31,20 +93,14 @@ export function updateUserCardPresence(card, presenceType, gameName) {
 }
 
 export async function updateFriendTilePresence(card, userId) {
-    try {
-        const res = await callRobloxApiJson({
-            subdomain: 'presence',
-            endpoint: '/v1/presence/users',
-            method: 'POST',
-            body: { userIds: [userId] },
-        }).catch(() => null);
-        if (!res?.userPresences?.length) return;
-        const p = res.userPresences[0];
-        const presenceType = p.userPresenceType ?? 0;
-        const gameName =
-            presenceType === 2 && p.lastLocation ? p.lastLocation : null;
-        updateUserCardPresence(card, presenceType, gameName);
-    } catch (e) {}
+    const presence = await fetchPresenceBatched(userId);
+    if (!presence) return;
+    const presenceType = presence.userPresenceType ?? 0;
+    const gameName =
+        presenceType === 2 && presence.lastLocation
+            ? presence.lastLocation
+            : null;
+    updateUserCardPresence(card, presenceType, gameName);
 }
 
 export async function batchFetchPresence(userIds) {
@@ -69,6 +125,7 @@ export function createUserCard({
     showUsername = true,
     presenceInfo = 0,
     gameName,
+    isVerified = false,
 }) {
     const presence = PRESENCE_MAP[presenceInfo] || PRESENCE_MAP[0];
     const showSublabel = showUsername && gameName ? true : showUsername;
@@ -76,12 +133,16 @@ export function createUserCard({
     const sublabelFontSize = gameName ? '9.6px' : '12px';
     const presenceTitle =
         presenceInfo === 2 && gameName ? gameName : presence.title;
+    const assets = getAssets();
+    const verifiedSvg = isVerified
+        ? `<img src="${assets.verifiedBadgeMono}" alt="" style="width: 14px; height: 14px; flex-shrink: 0; margin-left: 2px; vertical-align: middle; color: var(--rovalra-playbutton-color);">`
+        : '';
 
     const tileContainer = document.createElement('div');
-    tileContainer.className = 'user-card';
+    tileContainer.className = 'friends-carousel-tile';
     const innerHtml = `
-        <div class="user-card-content" style="width: 90px;">
-            <div class="avatar avatar-card-fullbody" style="width: 90px; height: 90px; position: relative;">
+        <div class="user-card user-card-content rovalra-user-card" style="width: 90px;">
+            <div class="avatar avatar-card-fullbody avatar-card-image-container user-profile-header-details-avatar-container" style="width: 90px; height: 90px; position: relative;">
                 ${href ? `<a href="${href}" class="avatar-card-link">` : ''}
                     <span class="thumbnail-2d-container avatar-card-image" style="width: 100%; height: 100%; display: block; overflow: hidden; border-radius: 50%; background: var(--rovalra-button-background-color);"></span>
                 ${href ? `</a>` : ''}
@@ -92,7 +153,7 @@ export function createUserCard({
                     ? `
             <div class="user-card-labels" style="display: block; margin-top: 8px; max-width: 90px; width: 90px;">
                 <div class="user-card-name" style="overflow: hidden; line-height: 1.2;">
-                    <span style="font-weight: 400; font-size: 12.8px; color: var(--rovalra-main-text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; max-width: 90px; text-align: center; transition: text-decoration 0.2s ease;">${displayName}</span>
+                    <span style="font-weight: 400; font-size: 12.8px; color: var(--rovalra-main-text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; max-width: 90px; text-align: center; transition: text-decoration 0.2s ease;">${displayName}${verifiedSvg}</span>
                 </div>
                 <div class="user-card-subname" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: ${sublabelFontSize}; color: var(--rovalra-secondary-text-color); max-width: 90px; display: block; text-align: center; transition: text-decoration 0.2s ease;">${sublabelText}</div>
             </div>
@@ -100,7 +161,7 @@ export function createUserCard({
                     : `
             <div class="user-card-labels-no-username" style="margin-top: 8px; max-width: 90px; width: 90px; text-align: center;">
                 <div class="user-card-name" style="overflow: hidden; line-height: 1.2;">
-                    <span style="font-weight: 400; font-size: 12.8px; color: var(--rovalra-main-text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; max-width: 90px; text-align: center; transition: text-decoration 0.2s ease;">${displayName}</span>
+                    <span style="font-weight: 400; font-size: 12.8px; color: var(--rovalra-main-text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; max-width: 90px; text-align: center; transition: text-decoration 0.2s ease;">${displayName}${verifiedSvg}</span>
                 </div>
             </div>
             `
@@ -115,27 +176,26 @@ export function createUserCard({
         height: '90px',
     });
     tileContainer.querySelector('.avatar-card-image').appendChild(thumbEl);
-    const card = tileContainer.firstElementChild;
-    card.style.cursor = href ? 'pointer' : 'default';
-    card.addEventListener('mouseenter', () => {
-        const nameSpan = card.querySelector('.user-card-name span');
+    tileContainer.style.cursor = href ? 'pointer' : 'default';
+    tileContainer.addEventListener('mouseenter', () => {
+        const nameSpan = tileContainer.querySelector('.user-card-name span');
         if (nameSpan) nameSpan.style.textDecoration = 'underline';
-        const subname = card.querySelector('.user-card-subname');
+        const subname = tileContainer.querySelector('.user-card-subname');
         if (subname) subname.style.textDecoration = 'underline';
     });
-    card.addEventListener('mouseleave', () => {
-        const nameSpan = card.querySelector('.user-card-name span');
+    tileContainer.addEventListener('mouseleave', () => {
+        const nameSpan = tileContainer.querySelector('.user-card-name span');
         if (nameSpan) nameSpan.style.textDecoration = 'none';
-        const subname = card.querySelector('.user-card-subname');
+        const subname = tileContainer.querySelector('.user-card-subname');
         if (subname) subname.style.textDecoration = 'none';
     });
-    return card;
+    return tileContainer;
 }
 
 export function createFriendTile(
     item,
     thumbData,
-    { displayName, username, isHidden },
+    { displayName, username, isHidden, isVerified = false },
 ) {
     const href = isHidden
         ? ''
@@ -146,26 +206,47 @@ export function createFriendTile(
         thumbData: thumbData || { state: 'Error' },
         href,
         presenceInfo: 0,
+        isVerified,
     });
 
-    if (!isHidden) {
+    if (
+        !isHidden &&
+        (displayName === 'Account Deleted' ||
+            username?.includes('Account Deleted'))
+    ) {
         callRobloxApiJson({
-            subdomain: 'presence',
-            endpoint: '/v1/presence/users',
-            method: 'POST',
-            body: { userIds: [item.id] },
+            subdomain: 'users',
+            endpoint: `/v1/users/${item.id}`,
+            method: 'GET',
         })
-            .then((res) => {
-                if (!res?.userPresences?.length) return;
-                const p = res.userPresences[0];
-                const presenceType = p.userPresenceType ?? 0;
-                const gameName =
-                    presenceType === 2 && p.lastLocation
-                        ? p.lastLocation
-                        : null;
-                updateUserCardPresence(card, presenceType, gameName);
+            .then((user) => {
+                if (user && user.name) {
+                    const nameSpan = card.querySelector('.user-card-name span');
+                    const subname = card.querySelector('.user-card-subname');
+                    if (nameSpan) {
+                        const textNode = Array.from(nameSpan.childNodes).find(
+                            (n) => n.nodeType === Node.TEXT_NODE,
+                        );
+                        if (textNode) textNode.textContent = user.displayName;
+                    }
+                    if (subname) {
+                        subname.textContent = `@${user.name}`;
+                    }
+                }
             })
             .catch(() => {});
+    }
+
+    if (!isHidden) {
+        fetchPresenceBatched(item.id).then((presence) => {
+            if (!presence) return;
+            const presenceType = presence.userPresenceType ?? 0;
+            const gameName =
+                presenceType === 2 && presence.lastLocation
+                    ? presence.lastLocation
+                    : null;
+            updateUserCardPresence(card, presenceType, gameName);
+        });
     }
 
     return card;
@@ -180,16 +261,31 @@ export async function createFriendTiles(
     const friendIds = items.filter((i) => i.id > 0).map((i) => i.id);
     const presenceMap = await batchFetchPresence(friendIds);
 
-    items.forEach((item) => {
+    for (const item of items) {
         const isHidden = item.id === -1;
         const profile = isHidden ? null : profiles.get(item.id);
-        if (!isHidden && !profile) return;
+        if (!isHidden && !profile) continue;
 
         const thumb = isHidden ? { state: 'Error' } : thumbData.get(item.id);
-        const displayName = isHidden
-            ? 'Hidden User'
-            : profile.names.combinedName;
-        const username = isHidden ? '' : `@${profile.names.username}`;
+        let displayName = isHidden ? 'Hidden User' : profile.names.combinedName;
+        let username = isHidden ? '' : profile.names.username;
+
+        if (
+            !isHidden &&
+            (displayName === 'Account Deleted' ||
+                username === 'Account Deleted')
+        ) {
+            const userRes = await callRobloxApiJson({
+                subdomain: 'users',
+                endpoint: `/v1/users/${item.id}`,
+                method: 'GET',
+            }).catch(() => null);
+
+            if (userRes && userRes.name) {
+                displayName = userRes.displayName;
+                username = userRes.name;
+            }
+        }
 
         const presence = isHidden ? null : presenceMap.get(item.id);
         const presenceType = presence?.userPresenceType ?? 0;
@@ -200,7 +296,7 @@ export async function createFriendTiles(
 
         const card = createUserCard({
             displayName,
-            username: gameName || username || '',
+            username: gameName || (username ? `@${username}` : ''),
             thumbData: thumb,
             href: isHidden
                 ? ''
@@ -209,7 +305,7 @@ export async function createFriendTiles(
             gameName: isHidden || !gameName ? '' : gameName,
         });
         containerEl.appendChild(card);
-    });
+    }
 }
 
 export async function createUserCardsFromIds(containerEl, ids, limit = 7) {
@@ -243,9 +339,28 @@ export async function createUserCardsFromIds(containerEl, ids, limit = 7) {
         (presenceRes?.userPresences || []).map((p) => [p.userId, p]),
     );
 
-    validIds.forEach((id) => {
+    for (const id of validIds) {
         const profile = profileMap.get(id);
-        if (!profile) return;
+        if (!profile) continue;
+
+        let displayName = profile.names.combinedName;
+        let username = profile.names.username;
+
+        if (
+            displayName === 'Account Deleted' ||
+            username === 'Account Deleted'
+        ) {
+            const userRes = await callRobloxApiJson({
+                subdomain: 'users',
+                endpoint: `/v1/users/${id}`,
+                method: 'GET',
+            }).catch(() => null);
+
+            if (userRes && userRes.name) {
+                displayName = userRes.displayName;
+                username = userRes.name;
+            }
+        }
 
         const presence = presenceMap.get(id);
         const presenceType = presence?.userPresenceType ?? 0;
@@ -255,14 +370,15 @@ export async function createUserCardsFromIds(containerEl, ids, limit = 7) {
                 : null;
 
         const card = createUserCard({
-            displayName: profile.names.combinedName,
-            username: `@${profile.names.username}`,
+            displayName: displayName,
+            username: `@${username}`,
             showUsername: true,
+            isVerified: profile.names.isVerified || false,
             thumbData: thumbMap.get(id) || { state: 'Error' },
             href: `https://www.roblox.com/users/${id}/profile`,
             presenceInfo: presenceType,
             gameName,
         });
         containerEl.appendChild(card);
-    });
+    }
 }

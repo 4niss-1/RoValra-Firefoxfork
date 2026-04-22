@@ -7,16 +7,66 @@ import { getAuthenticatedUserId } from '../user.js';
 import {
     getUserDescription,
     updateUserDescription,
+    updateUserSettingViaApi,
 } from '../profile/descriptionhandler.js';
 import { createAndShowPopup } from '../../features/catalog/40method.js';
+import * as CacheHandler from '../storage/cacheHandler.js';
 
 let currentUserTier = 0;
+let gradientSyncTimeout = null;
 let donatorTierPromise = null;
+const colorLiveSaveTimeouts = new Map();
 
 export const getCurrentUserTier = () => currentUserTier;
 
 export const syncDonatorTier = async () => {
     if (donatorTierPromise) return donatorTierPromise;
+
+    const now = Date.now();
+    const currentHref = window.location.href;
+    const currentPath = window.location.pathname;
+    const storePageUrl = 'store-section/9452973012';
+    const currentUserId = await getAuthenticatedUserId();
+
+    const state = (await CacheHandler.get(
+        'donator_info',
+        'sync_state',
+        'local',
+    )) || {
+        lastSync: 0,
+        cachedResponse: null,
+        priorityActive: false,
+        checksLeft: 0,
+        lastPath: '',
+        lastTier: 0,
+        userId: null,
+    };
+
+    if (state.userId !== currentUserId) {
+        state.lastSync = 0;
+        state.cachedResponse = null;
+        state.lastTier = 0;
+        state.userId = currentUserId;
+        currentUserTier = 0;
+
+        await CacheHandler.set('donator_info', 'sync_state', state, 'local');
+    }
+
+    if (state.lastTier !== undefined) currentUserTier = state.lastTier;
+
+    if (currentHref.includes(storePageUrl)) {
+        state.priorityActive = true;
+        state.checksLeft = 10;
+    }
+
+    const isUrlChange = currentPath !== state.lastPath;
+    const isPriorityCheck =
+        state.priorityActive && isUrlChange && state.checksLeft > 0;
+    const isExpired = now - state.lastSync > 5 * 60 * 1000;
+
+    if (state.cachedResponse && !isPriorityCheck && !isExpired) {
+        return state.cachedResponse;
+    }
 
     donatorTierPromise = (async () => {
         try {
@@ -28,8 +78,7 @@ export const syncDonatorTier = async () => {
             });
 
             if (response.status !== 'success' || !response.badges) {
-                donatorTierPromise = null;
-                return null;
+                return state.cachedResponse || null;
             }
 
             const badges = response.badges;
@@ -41,7 +90,32 @@ export const syncDonatorTier = async () => {
             } else if (badges.donator_1 === true) {
                 tier = 1;
             }
+
+            if (state.priorityActive && isUrlChange) {
+                if (tier !== state.lastTier) {
+                    state.priorityActive = false;
+                    state.checksLeft = 0;
+                } else {
+                    state.checksLeft--;
+                    if (state.checksLeft <= 0) {
+                        state.priorityActive = false;
+                    }
+                }
+            }
+
             currentUserTier = tier;
+            state.lastTier = tier;
+            state.lastSync = Date.now();
+            state.lastPath = currentPath;
+            state.cachedResponse = response;
+            state.userId = currentUserId;
+
+            await CacheHandler.set(
+                'donator_info',
+                'sync_state',
+                state,
+                'local',
+            );
 
             const settingsContent = document.querySelector(
                 '#setting-section-content',
@@ -54,8 +128,9 @@ export const syncDonatorTier = async () => {
             return response;
         } catch (error) {
             console.error('RoValra: Failed to sync donator tier', error);
+            return state.cachedResponse || null;
+        } finally {
             donatorTierPromise = null;
-            return null;
         }
     })();
 
@@ -149,6 +224,8 @@ export const handleSaveSettings = async (settingName, value) => {
                 case 'text':
                 case 'input':
                 case 'select':
+                case 'color':
+                case 'gradient':
                     if (value === null) {
                         sanitizedValue = null;
                     } else if (typeof value === 'string') {
@@ -181,6 +258,27 @@ export const handleSaveSettings = async (settingName, value) => {
                                     settingConfig.default ?? validValues[0];
                             }
                         }
+                    } else if (
+                        settingConfig.type === 'gradient' &&
+                        typeof value === 'object'
+                    ) {
+                        sanitizedValue = {
+                            enabled: value.enabled !== false,
+                            color1: sanitizeString(
+                                String(value.color1 || '#667eea'),
+                            ),
+                            color2: sanitizeString(
+                                String(value.color2 || '#764ba2'),
+                            ),
+                            angle: Math.max(
+                                0,
+                                Math.min(360, parseInt(value.angle, 10) || 0),
+                            ),
+                            fade: Math.max(
+                                0,
+                                Math.min(100, parseInt(value.fade, 10) || 0),
+                            ),
+                        };
                     } else {
                         console.warn(
                             `Invalid string value for '${settingName}' - converting to string and sanitizing`,
@@ -244,6 +342,26 @@ export const handleSaveSettings = async (settingName, value) => {
                     reject(chrome.runtime.lastError);
                 } else {
                     syncToSettingsKey(settingName, sanitizedValue);
+                    if (settingName === 'profileGradient' && sanitizedValue) {
+                        if (gradientSyncTimeout)
+                            clearTimeout(gradientSyncTimeout);
+                        gradientSyncTimeout = setTimeout(async () => {
+                            const isDonator = currentUserTier >= 2;
+                            if (isDonator) {
+                                const val = sanitizedValue.enabled
+                                    ? `${sanitizedValue.color1}, ${sanitizedValue.color2}, ${sanitizedValue.fade}, ${sanitizedValue.angle}`
+                                    : '';
+
+                                updateUserSettingViaApi('gradient', val).catch(
+                                    (error) =>
+                                        console.error(
+                                            'RoValra: Gradient sync failed',
+                                            error,
+                                        ),
+                                );
+                            }
+                        }, 1000);
+                    }
                     resolve();
                 }
             });
@@ -364,7 +482,16 @@ export const initSettings = async (settingsContent) => {
                         if (element._dropdownApi) {
                             element._dropdownApi.setValue(savedValue);
                         }
-                    } else if (setting.type === 'input') {
+                    } else if (setting.type === 'gradient') {
+                        if (element.rovalraGradientApi) {
+                            element.rovalraGradientApi.setValue(
+                                settings[settingName] || setting.default,
+                            );
+                        }
+                    } else if (
+                        setting.type === 'input' ||
+                        setting.type === 'color'
+                    ) {
                         element.value = settings[settingName] || '';
                         element.dispatchEvent(
                             new Event('input', { bubbles: true }),
@@ -450,7 +577,17 @@ export const initSettings = async (settingsContent) => {
                                         },
                                     );
                                 }
-                            } else if (childSetting.type === 'input') {
+                            } else if (childSetting.type === 'gradient') {
+                                if (childElement.rovalraGradientApi) {
+                                    childElement.rovalraGradientApi.setValue(
+                                        settings[childName] ||
+                                            childSetting.default,
+                                    );
+                                }
+                            } else if (
+                                childSetting.type === 'input' ||
+                                childSetting.type === 'color'
+                            ) {
                                 childElement.value = settings[childName] || '';
                                 childElement.dispatchEvent(
                                     new Event('input', { bubbles: true }),
@@ -544,11 +681,13 @@ export const applyLockedState = (
         if (isLocked) {
             wrapper.classList.add('setting-locked');
             wrapper.style.setProperty('opacity', '1', 'important');
-            wrapper.style.pointerEvents = 'none';
+            wrapper.style.setProperty('pointer-events', 'none', 'important');
         } else {
             wrapper.classList.remove('setting-locked');
             wrapper.style.removeProperty('opacity');
-            wrapper.style.setProperty('pointer-events', 'auto');
+            if (!wrapper.classList.contains('disabled-setting')) {
+                wrapper.style.setProperty('pointer-events', 'auto');
+            }
         }
 
         if (isDonatorLock) {
@@ -588,7 +727,9 @@ export const applyLockedState = (
             });
 
             wrapper.querySelectorAll('input, select, button').forEach((el) => {
-                el.disabled = true;
+                if (!el.dataset.forceEnabled) {
+                    el.disabled = true;
+                }
             });
         } else {
             Array.from(wrapper.children).forEach((child) => {
@@ -596,7 +737,10 @@ export const applyLockedState = (
             });
 
             wrapper.querySelectorAll('input, select, button').forEach((el) => {
-                if (!wrapper.classList.contains('disabled-setting')) {
+                if (
+                    !wrapper.classList.contains('disabled-setting') &&
+                    !wrapper.classList.contains('setting-locked')
+                ) {
                     el.disabled = false;
                 }
             });
@@ -606,14 +750,19 @@ export const applyLockedState = (
         wrapper.classList.remove('donator-locked');
         wrapper.style.removeProperty('opacity');
         wrapper.style.removeProperty('filter');
-        wrapper.style.setProperty('pointer-events', 'auto');
+        if (!wrapper.classList.contains('disabled-setting')) {
+            wrapper.style.setProperty('pointer-events', 'auto');
+        }
 
         Array.from(wrapper.children).forEach((child) => {
             child.style.opacity = '';
         });
 
         wrapper.querySelectorAll('input, select, button').forEach((el) => {
-            if (!wrapper.classList.contains('disabled-setting')) {
+            if (
+                !wrapper.classList.contains('disabled-setting') &&
+                !wrapper.classList.contains('setting-locked')
+            ) {
                 el.disabled = false;
             }
         });
@@ -703,26 +852,36 @@ function applyDisabledState(
     if (isDisabled && isPermissionRelated) {
         if (toggleSwitch) {
             toggleSwitch.style.opacity = '0.5';
-            toggleSwitch.style.pointerEvents = 'none';
+            toggleSwitch.style.setProperty(
+                'pointer-events',
+                'none',
+                'important',
+            );
         }
         if (inputElement.type === 'checkbox') inputElement.disabled = true;
     } else if (isDisabled) {
         wrapper.classList.add('disabled-setting');
         wrapper.style.opacity = '0.5';
-        wrapper.style.pointerEvents = 'none';
+        wrapper.style.setProperty('pointer-events', 'none', 'important');
         wrapper.querySelectorAll('input, select, button').forEach((el) => {
             el.disabled = true;
         });
     } else {
         wrapper.classList.remove('disabled-setting');
         wrapper.style.opacity = '1';
-        wrapper.style.pointerEvents = 'auto';
+        if (!wrapper.classList.contains('setting-locked')) {
+            wrapper.style.setProperty('pointer-events', 'auto');
+        }
         wrapper.querySelectorAll('input, select, button').forEach((el) => {
-            el.disabled = false;
+            if (!wrapper.classList.contains('setting-locked')) {
+                el.disabled = false;
+            }
         });
         if (toggleSwitch) {
             toggleSwitch.style.opacity = '1';
-            toggleSwitch.style.pointerEvents = 'auto';
+            if (!wrapper.classList.contains('setting-locked')) {
+                toggleSwitch.style.setProperty('pointer-events', 'auto');
+            }
         }
     }
 }
@@ -907,6 +1066,18 @@ export async function handlePermissionToggle(event) {
         }
     }
     await updateAllPermissionToggles();
+}
+
+function formatBytes(bytes, decimals = 2) {
+    if (bytes === 0) return '0 Bytes';
+
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
 export function initializeSettingsEventListeners() {
@@ -1168,6 +1339,20 @@ export function initializeSettingsEventListeners() {
         input.click();
     });
 
+    document.addEventListener('rovalra:showLocalStorageUsage', async () => {
+        chrome.storage.local.get(null, (items) => {
+            let totalBytes = 0;
+            for (const key in items) {
+                if (Object.prototype.hasOwnProperty.call(items, key)) {
+                    const item = items[key];
+                    const itemSize = JSON.stringify(item).length;
+                    totalBytes += itemSize;
+                }
+            }
+            alert(`Total Local Storage Used: ${formatBytes(totalBytes)}`);
+        });
+    });
+
     chrome.runtime.onMessage.addListener((request) => {
         if (request.action === 'permissionsUpdated') {
             updateAllPermissionToggles();
@@ -1312,6 +1497,9 @@ export function initializeSettingsEventListeners() {
                 toggleElement.checked = value > 0;
             }
             savePromises.push(handleSaveSettings(settingName, value));
+        } else if (target.matches('input[type="color"]')) {
+            value = target.value;
+            savePromises.push(handleSaveSettings(settingName, value));
         } else {
             return;
         }
@@ -1343,6 +1531,24 @@ export function initializeSettingsEventListeners() {
             .catch((error) => {
                 console.error('Error saving one or more settings:', error);
             });
+    });
+
+    document.addEventListener('input', (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLInputElement)) return;
+        if (target.type !== 'color') return;
+        const settingName = target.dataset.settingName;
+        if (!settingName) return;
+
+        const existing = colorLiveSaveTimeouts.get(settingName);
+        if (existing) clearTimeout(existing);
+        const timeoutId = setTimeout(() => {
+            colorLiveSaveTimeouts.delete(settingName);
+            handleSaveSettings(settingName, target.value).catch((error) => {
+                console.error('Error saving color setting:', error);
+            });
+        }, 80);
+        colorLiveSaveTimeouts.set(settingName, timeoutId);
     });
 
     document.addEventListener('click', (event) => {

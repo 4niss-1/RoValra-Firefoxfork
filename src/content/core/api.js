@@ -207,6 +207,7 @@ export async function callRobloxApi(options) {
             signal,
             useBackground = false,
             useApiKey = false,
+            noCache = false,
         } = options;
 
         if (useApiKey) {
@@ -227,6 +228,7 @@ export async function callRobloxApi(options) {
                             method,
                             body,
                             headers,
+                            noCache,
                         },
                     },
                     (response) => {
@@ -301,9 +303,9 @@ export async function callRobloxApi(options) {
         let fullUrl = customFullUrl || `${baseUrl}${endpoint}`;
 
         if (fullUrl.includes('?')) {
-            fullUrl += `&_RoValraRequest=`;
+            fullUrl += `&_RoValraRequest=${noCache ? Date.now() : ''}`;
         } else {
-            fullUrl += `?_RoValraRequest=`;
+            fullUrl += `?_RoValraRequest=${noCache ? Date.now() : ''}`;
         }
 
         const isMutatingMethod = ['POST', 'PATCH', 'DELETE'].includes(
@@ -323,6 +325,7 @@ export async function callRobloxApi(options) {
             headers: normalizedHeaders,
             credentials,
             signal,
+            cache: noCache ? 'no-store' : 'default',
         };
 
         if (body) {
@@ -346,9 +349,14 @@ export async function callRobloxApi(options) {
             for (let attempt = 0; attempt < 4; attempt++) {
                 try {
                     lastResponse = await fetch(fullUrl, fetchOptions);
-                    // TODO This dont work update it at some point.
-                    const newAccessToken =
-                        lastResponse.headers.get('X-New-Access-Token');
+                    let newAccessToken = null;
+                    try {
+                        const bodyClone = await lastResponse.clone().json();
+                        if (bodyClone && bodyClone.accessToken) {
+                            newAccessToken = bodyClone.accessToken;
+                        }
+                    } catch (e) {}
+
                     if (newAccessToken) {
                         try {
                             const authedUserId = await getAuthenticatedUserId();
@@ -364,20 +372,18 @@ export async function callRobloxApi(options) {
 
                                 if (storedVerification) {
                                     console.log(
-                                        'RoValra API: New token received from header. Updating storage.',
+                                        'RoValra API: New token detected in body. Updating storage.',
                                     );
                                     storedVerification.accessToken =
                                         newAccessToken;
                                     storedVerification.timestamp = Date.now();
 
                                     try {
-                                        const cloned = lastResponse.clone();
-                                        const data = await cloned.json();
-                                        if (data && data.expires_at) {
-                                            storedVerification.expiresAt =
-                                                data.expires_at * 1000;
-                                        }
+                                        const data = await lastResponse
+                                            .clone()
+                                            .json();
                                     } catch {}
+
                                     allVerifications[authedUserId] =
                                         storedVerification;
                                     await chrome.storage.local.set({
@@ -624,6 +630,7 @@ export async function callRobloxApiJson(options) {
             `API request failed with status ${response.status}`,
         );
         error.response = errorBody;
+        error.status = response.status;
         throw error;
     }
     return await response.json();
